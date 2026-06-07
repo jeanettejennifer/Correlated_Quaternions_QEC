@@ -1,0 +1,6 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+stim_files/
+results/
+snakes_and_ladders_adapting_the_surface_code_to_defects/
