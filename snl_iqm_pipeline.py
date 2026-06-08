@@ -6,6 +6,7 @@ import re
 import subprocess
 import sys
 import warnings
+from collections import defaultdict
 from pathlib import Path
 
 os.environ.setdefault("MPLCONFIGDIR", "/private/tmp/matplotlib")
@@ -520,15 +521,15 @@ def build_optimized_defective_patch(
 def hardware_faulty_region_demo_kwargs(
     distance: int = 3,
     defect_qubits=(),
-    defect_couplers=("QB45_QB46",),
+    defect_couplers=("QB24_QB32",),
     cal: str = CAL,
     use_calibration_defects: bool = False,
 ) -> dict:
-    """Return a fixed real-Emerald SnL patch around the top-center faulty region.
+    """Return a fixed real-Emerald SnL patch around the lower-left faulty region.
 
     This is meant for the hardware demo: it finds a real d=3 patch containing
-    the QB45-QB46 coupler, then returns the exact kwargs to pass into
-    `run_snl_round_sweep`. QB46 itself is kept usable; only the coupler is
+    the QB24-QB32 coupler, then returns the exact kwargs to pass into
+    `run_snl_round_sweep`. The adjacent qubits are kept usable; only the coupler is
     treated as unavailable unless `defect_qubits` is explicitly provided. We
     disable layout optimization afterwards so the experiment stays on this
     chosen physical part of the chip.
@@ -707,6 +708,7 @@ def run_one_round_count(
     job = result = counts = iqm_qc = None
     backend_mapping = None
     skipped_hardware_ops = []
+    swap_count = None
     if mode == "synthetic":
         raw_measurements = decoder_c.compile_sampler().sample(shots).astype(bool)
         memory = base.stim_measurements_to_qiskit_memory(raw_measurements)
@@ -728,6 +730,7 @@ def run_one_round_count(
         else:
             warnings.warn("Backend validation against the full Stim circuit was skipped because impossible operations were intentionally omitted.")
         iqm_qc = transpile(qc, backend=backend, optimization_level=1, initial_layout=base.identity_initial_layout(qc))
+        swap_count = iqm_qc.count_ops().get("swap", 0)
         job = backend.run(iqm_qc, shots=shots, use_timeslot=use_timeslot)
         result = job.result()
         memory, counts = base.result_to_memory(result)
@@ -753,6 +756,7 @@ def run_one_round_count(
         "optimize_layout": bool(patch_data.get("optimize_layout", False)),
         "sw_offset": patch_data["sw_offset"],
         "layout_score": patch_data.get("layout_score"),
+        "swap_count": swap_count,
         "skipped_hardware_operation_count": len(skipped_hardware_ops),
     }
     return {
@@ -805,6 +809,43 @@ def _plot_layer(result: dict, layer: str, ax):
     def order(points, center):
         return sorted(points, key=lambda p: math.atan2(p[1] - center[1], p[0] - center[0]))
 
+    def gauge_polygon(gauge):
+        pts = [pos_xy(q) for q in gauge.data_qubits]
+        if len(pts) == 2:
+            pts = pts + [pos_xy(gauge.only_ancilla)]
+        if len(pts) < 3:
+            return []
+        return order(pts, pos_xy(gauge.only_ancilla))
+
+    def draw_super_boundary(gauges, color):
+        edge_counts = defaultdict(int)
+        edge_points = {}
+
+        def key(point):
+            return (round(float(point[0]), 6), round(float(point[1]), 6))
+
+        for gauge in gauges:
+            poly = gauge_polygon(gauge)
+            if len(poly) < 3:
+                continue
+            for p0, p1 in zip(poly, poly[1:] + poly[:1]):
+                edge_key = tuple(sorted((key(p0), key(p1))))
+                edge_counts[edge_key] += 1
+                edge_points[edge_key] = (p0, p1)
+
+        for edge_key, count in edge_counts.items():
+            if count != 1:
+                continue
+            p0, p1 = edge_points[edge_key]
+            ax.plot(
+                [p0[0], p1[0]], [p0[1], p1[1]],
+                color=color,
+                lw=2.6,
+                linestyle=(0, (6, 4)),
+                solid_capstyle="round",
+                zorder=5,
+            )
+
     ax.set_aspect("equal")
     ax.axis("off")
 
@@ -828,20 +869,16 @@ def _plot_layer(result: dict, layer: str, ax):
         color = "#4f7cff" if s.type == PauliT.X else "#ff5a5f"
         edge = "#1d4ed8" if s.type == PauliT.X else "#b91c1c"
         for g in gauges:
-            pts = [pos_xy(q) for q in g.data_qubits]
-            if len(pts) == 2:
-                pts = pts + [pos_xy(g.only_ancilla)]
+            pts = gauge_polygon(g)
             center = pos_xy(g.only_ancilla)
             if len(pts) >= 3:
-                ax.add_patch(Polygon(order(pts, center), closed=True, facecolor=color, edgecolor=edge, lw=1.8, alpha=0.2, zorder=2))
+                ax.add_patch(Polygon(pts, closed=True, facecolor=color, edgecolor=edge, lw=1.8, alpha=0.2, zorder=2))
             x, y = center
             ax.text(x, y, "X" if s.type == PauliT.X else "Z", ha="center", va="center", color="white", fontsize=8, fontweight="bold",
                     bbox={"boxstyle": "circle,pad=0.2", "facecolor": edge, "edgecolor": "white"}, zorder=6)
 
         if isinstance(s, SuperStabilizer):
-            pts = [pos_xy(q) for q in s.data_qubits] + [pos_xy(a) for a in s.ancilla]
-            center = (float(np.mean([p[0] for p in pts])), float(np.mean([p[1] for p in pts])))
-            ax.add_patch(Polygon(order(pts, center), closed=True, facecolor="none", edgecolor=edge, lw=2.5, linestyle=(0, (6, 4)), zorder=5))
+            draw_super_boundary(gauges, edge)
 
     for p in sorted(visible):
         x, y = pos_xy(p)
@@ -999,7 +1036,7 @@ def fit_snl_round_sweep(results: list[dict]) -> dict:
 
 
 def plot_snl_logical_error_rate(fit: dict, save_path: str | None = None):
-    """Plot logical error probability vs rounds with linear and log-y panels."""
+    """Plot logical error probability vs rounds on a readable linear scale."""
     import matplotlib.pyplot as plt
 
     rounds = fit["rounds"]
@@ -1037,31 +1074,18 @@ def plot_snl_logical_error_rate(fit: dict, save_path: str | None = None):
         ax.set_ylim(max(0.0, lo - margin), min(1.0, hi + margin))
 
     plotted_values = [*y_c, *y_u, *fit_y_c, *fit_y_u]
-    if fit["corrected_was_folded"] or fit["uncorrected_was_folded"]:
-        plotted_values += [*fit["corrected_prob"], *fit["uncorrected_prob"]]
-
-    fig, axes = plt.subplots(1, 2, figsize=(13, 4.6))
-    for ax, log_scale in [(axes[0], False), (axes[1], True)]:
-        ax.plot(rounds, y_u, "o", color="#94a3b8", label="uncorrected probability")
-        ax.plot(xs, fit_y_u, "--", color="#64748b", label=f"uncorrected fit, eps_L={eps_u:.4g}")
-        ax.plot(rounds, y_c, "o", color="#2563eb", label="MWPM corrected probability")
-        ax.plot(xs, fit_y_c, "-", color="#2563eb", label=f"corrected fit, eps_L={eps_c:.4g}")
-        if fit["corrected_was_folded"] or fit["uncorrected_was_folded"]:
-            ax.plot(rounds, fit["uncorrected_prob"], "x", color="#64748b", alpha=0.6, label="raw uncorrected")
-            ax.plot(rounds, fit["corrected_prob"], "x", color="#2563eb", alpha=0.6, label="raw corrected")
-        ax.axhline(0.5, color="black", lw=1, alpha=0.25)
-        ax.set_xlabel("surface-code rounds")
-        ax.set_ylabel("logical error probability")
-        ax.grid(True, alpha=0.3)
-        if log_scale:
-            ax.set_yscale("log")
-            set_relevant_ylim(ax, plotted_values, log_scale=True)
-            ax.set_title("log scale")
-        else:
-            set_relevant_ylim(ax, plotted_values, log_scale=False)
-            ax.set_title("linear scale")
-    axes[1].legend(loc="best", fontsize=8)
-    fig.suptitle("Snakes-and-Ladders logical error rate extraction", fontsize=13)
+    fig, ax = plt.subplots(figsize=(7.2, 4.8))
+    ax.plot(rounds, y_u, "o", color="#94a3b8", label="uncorrected probability")
+    ax.plot(xs, fit_y_u, "--", color="#64748b", label=f"uncorrected fit, eps_L={eps_u:.4g}")
+    ax.plot(rounds, y_c, "o", color="#2563eb", label="MWPM corrected probability")
+    ax.plot(xs, fit_y_c, "-", color="#2563eb", label=f"corrected fit, eps_L={eps_c:.4g}")
+    ax.axhline(0.5, color="black", lw=1, alpha=0.25)
+    ax.set_xlabel("surface-code rounds")
+    ax.set_ylabel("logical error probability")
+    ax.grid(True, alpha=0.3)
+    set_relevant_ylim(ax, plotted_values, log_scale=False)
+    ax.legend(loc="best", fontsize=8)
+    ax.set_title(f"Snakes-and-Ladders LER extraction\nMWPM eps_L={eps_c:.4g}, uncorrected eps_L={eps_u:.4g}", fontsize=12)
     fig.tight_layout()
     if save_path:
         fig.savefig(save_path, dpi=220, bbox_inches="tight")
@@ -1159,6 +1183,7 @@ def run_snl_round_sweep(
             f"rounds={rounds} | "
             f"logical_error_probability={out['summary']['logical_error_probability']:.5g} | "
             f"uncorrected={out['summary']['uncorrected_logical_error_probability']:.5g} | "
+            f"swap_count={out['summary']['swap_count']} | "
             f"job={out['summary']['job_id']}"
         )
 
@@ -1183,6 +1208,8 @@ def run_snl_round_sweep(
             "sw_offset": results[0]["sw_offset"],
             "logical_error_rate": fit["corrected_fit"]["epsilon_l"],
             "uncorrected_logical_error_rate": fit["uncorrected_fit"]["epsilon_l"],
+            "swap_count": results[0]["summary"]["swap_count"],
+            "skipped_hardware_operation_count": results[0]["summary"]["skipped_hardware_operation_count"],
         },
     }
 

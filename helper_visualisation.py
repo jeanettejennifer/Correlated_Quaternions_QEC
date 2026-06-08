@@ -572,6 +572,48 @@ def _order_polygon(points: list[tuple[float, float]], center: tuple[float, float
     return sorted(points, key=lambda p: math.atan2(p[1] - center[1], p[0] - center[0]))
 
 
+def _snl_gauge_polygon_points(gauge) -> list[tuple[float, float]]:
+    pts = [_pos_xy(q) for q in gauge.data_qubits]
+    if len(pts) == 2:
+        pts.append(_pos_xy(gauge.only_ancilla))
+    if len(pts) < 3:
+        return []
+    return _order_polygon(pts, _pos_xy(gauge.only_ancilla))
+
+
+def _draw_snl_superstabilizer_boundary(ax, gauges, color: str, lw: float = 2.8):
+    """Draw the exterior boundary of the union of a super-stabilizer's gauges."""
+    edge_counts = defaultdict(int)
+    edge_points = {}
+
+    def key(point):
+        return (round(float(point[0]), 6), round(float(point[1]), 6))
+
+    for gauge in gauges:
+        poly = _snl_gauge_polygon_points(gauge)
+        if len(poly) < 3:
+            continue
+        for p0, p1 in zip(poly, poly[1:] + poly[:1]):
+            k0, k1 = key(p0), key(p1)
+            edge_key = tuple(sorted((k0, k1)))
+            edge_counts[edge_key] += 1
+            edge_points[edge_key] = (p0, p1)
+
+    for edge_key, count in edge_counts.items():
+        if count != 1:
+            continue
+        p0, p1 = edge_points[edge_key]
+        ax.plot(
+            [p0[0], p1[0]],
+            [p0[1], p1[1]],
+            color=color,
+            lw=lw,
+            linestyle=(0, (6, 4)),
+            zorder=6,
+            solid_capstyle="round",
+        )
+
+
 def _snl_stabilizer_links(patch) -> set[tuple[Pos, Pos]]:
     links = set()
     for stabilizer in patch.stabilizers:
@@ -645,13 +687,11 @@ def _draw_snl_layer(ax, result: dict, layer: str, show_full_context: bool = Fals
         label = "X" if stabilizer.type == PauliT.X else "Z"
 
         for gauge in gauges:
-            pts = [_pos_xy(q) for q in gauge.data_qubits]
-            if len(pts) == 2:
-                pts.append(_pos_xy(gauge.only_ancilla))
+            pts = _snl_gauge_polygon_points(gauge)
             center = _pos_xy(gauge.only_ancilla)
             if len(pts) >= 3:
                 ax.add_patch(Polygon(
-                    _order_polygon(pts, center),
+                    pts,
                     closed=True,
                     facecolor=color,
                     edgecolor=edge,
@@ -668,18 +708,7 @@ def _draw_snl_layer(ax, result: dict, layer: str, show_full_context: bool = Fals
 
         # Dashed outline of the full superstabilizer support.
         if isinstance(stabilizer, SuperStabilizer):
-            pts = [_pos_xy(q) for q in stabilizer.data_qubits] + [_pos_xy(a) for a in stabilizer.ancilla]
-            if len(pts) >= 3:
-                center = (float(np.mean([p[0] for p in pts])), float(np.mean([p[1] for p in pts])))
-                ax.add_patch(Polygon(
-                    _order_polygon(pts, center),
-                    closed=True,
-                    facecolor="none",
-                    edgecolor=edge,
-                    lw=2.6,
-                    linestyle=(0, (6, 4)),
-                    zorder=6,
-                ))
+            _draw_snl_superstabilizer_boundary(ax, gauges, edge)
 
     for p in sorted(visible):
         x, y = _pos_xy(p)

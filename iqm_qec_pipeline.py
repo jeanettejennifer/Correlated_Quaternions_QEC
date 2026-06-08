@@ -437,9 +437,11 @@ def stim_to_qiskit_mapped_tolerant(
     mapping: dict,
     backend=None,
     unavailable_backend_qubits: set[int] | None = None,
+    unavailable_backend_couplers: set[tuple[int, int]] | None = None,
 ) -> tuple[QuantumCircuit, list[tuple[int, int, int]], list[tuple]]:
     """Convert Stim to Qiskit, warning and skipping impossible hardware operations."""
     unavailable_backend_qubits = unavailable_backend_qubits or set()
+    unavailable_backend_couplers = {tuple(sorted(edge)) for edge in (unavailable_backend_couplers or set())}
     qr, cr = QuantumRegister(max(mapping.values()) + 1, "q"), ClassicalRegister(c.num_measurements, "m")
     qc, meas, skipped, k = QuantumCircuit(qr, cr), [], [], 0
     hw_edges = {tuple(sorted(edge)) for edge in backend.coupling_map.get_edges()} if backend is not None else None
@@ -498,6 +500,9 @@ def stim_to_qiskit_mapped_tolerant(
                 stim_edge = (int(t[i].value), int(t[i + 1].value))
                 if qa is None or qb is None:
                     skipped.append((name, stim_edge, "unavailable or unmapped endpoint"))
+                    continue
+                if tuple(sorted((qa, qb))) in unavailable_backend_couplers:
+                    skipped.append((name, stim_edge, "explicitly unavailable backend coupler"))
                     continue
                 if hw_edges is not None and tuple(sorted((qa, qb))) not in hw_edges:
                     skipped.append((name, stim_edge, "non-native backend coupler"))
@@ -971,6 +976,31 @@ def calibrated_decoder_circuit(c: stim.Circuit, mapping: dict, d: int, r: int, b
     raise ValueError("mode must be 'exact' or 'average'")
 
 
+def add_synthetic_defect_noise(
+    c: stim.Circuit,
+    defect_qubits=(),
+    defect_couplers=(),
+    probability: float = 0.5,
+) -> stim.Circuit:
+    """Add strong depolarizing noise to selected Stim qubits/couplers."""
+    defect_qubits = [int(q) for q in defect_qubits or ()]
+    defect_couplers = {tuple(sorted((int(a), int(b)))) for a, b in (defect_couplers or ())}
+    if not defect_qubits and not defect_couplers:
+        return c
+    out = stim.Circuit()
+    for ins in c.flattened():
+        name, targets = ins.name, ins.targets_copy()
+        out.append(ins.name, ins.targets_copy(), ins.gate_args_copy())
+        if name == "TICK" and defect_qubits:
+            out.append("DEPOLARIZE1", defect_qubits, probability)
+        elif name in ("CX", "CNOT", "CZ") and defect_couplers:
+            for i in range(0, len(targets), 2):
+                edge = tuple(sorted((int(targets[i].value), int(targets[i + 1].value))))
+                if edge in defect_couplers:
+                    out.append("DEPOLARIZE2", [edge[0], edge[1]], probability)
+    return out
+
+
 def decode(c: stim.Circuit, decoder_c: stim.Circuit, memory: list[str]) -> dict:
     dets, obs = extract_syndromes(c, memory)
     pred = pymatching.Matching.from_detector_error_model(decoder_c.detector_error_model(decompose_errors=True)).decode_batch(dets).astype(bool)
@@ -1059,6 +1089,11 @@ def run_pipeline(
     save_stim_file=True,
     optimize_layout: bool | None = None,
     allow_skipped_hardware_gates: bool = True,
+    synthetic_defect_qubits=None,
+    synthetic_defect_couplers=None,
+    synthetic_defect_probability: float = 0.5,
+    fixed_mapping: dict[int, int] | None = None,
+    unavailable_iqm_couplers=None,
 ):
     """Run the QEC pipeline on IQM hardware or synthetic samples.
 
@@ -1070,6 +1105,13 @@ def run_pipeline(
         optimize_layout: If None, defaults to True on hardware and False for synthetic.
         allow_skipped_hardware_gates: If True, unavailable qubits/couplers are
             warned about and skipped in hardware submission instead of raising.
+        synthetic_defect_qubits: Optional Stim qubit indices to damage in
+            synthetic mode by adding depolarizing noise after each TICK.
+        synthetic_defect_couplers: Optional Stim couplers/edges to damage in
+            synthetic mode by adding depolarizing noise after matching CZ gates.
+        fixed_mapping: Optional explicit {Stim qubit: IQM QB label} placement.
+        unavailable_iqm_couplers: Optional IQM couplers to skip in hardware mode,
+            e.g. ["QB24_QB32"] or [(24, 32)].
     """
     if run_mode not in {"hardware", "synthetic"}:
         raise ValueError("run_mode must be 'hardware' or 'synthetic'")
@@ -1092,8 +1134,37 @@ def run_pipeline(
             provider = IQMProvider(api_url or os.environ.get("IQM_API_URL", "https://resonance.iqm.tech/"), quantum_computer=quantum_computer, token=token or os.environ["IQM_TOKEN"])
             backend = provider.get_backend()
 
-    if optimize_layout:
+    unavailable_iqm_couplers = unavailable_iqm_couplers or []
+    unavailable_iqm_couplers = {
+        tuple(sorted(map(int, re.findall(r"QB(\d+)", edge)))) if isinstance(edge, str)
+        else tuple(sorted((int(edge[0]), int(edge[1]))))
+        for edge in unavailable_iqm_couplers
+    }
+
+    if fixed_mapping is not None:
+        mapping = {int(k): int(v) for k, v in fixed_mapping.items()}
+        layout_diagnostics = {
+            "mapping_source": "fixed_mapping",
+            "score": None,
+            "usable_twoq_gate_count": int(sum(twoq_edges(c).values())),
+            "missing_twoq_gate_count": None,
+            "min_used_cz_fidelity": None,
+            "candidate_count": None,
+            "exact_graph_error": None,
+        }
+    elif optimize_layout:
         mapping, layout_diagnostics = optimized_mapping(c, cal=cal, backend=backend, allow_skipped_gates=allow_skipped_hardware_gates)
+    elif run_mode == "synthetic":
+        mapping = {int(q): int(q) for q in c.get_final_qubit_coordinates()}
+        layout_diagnostics = {
+            "mapping_source": "synthetic_identity",
+            "score": None,
+            "usable_twoq_gate_count": int(sum(twoq_edges(c).values())),
+            "missing_twoq_gate_count": 0,
+            "min_used_cz_fidelity": None,
+            "candidate_count": None,
+            "exact_graph_error": None,
+        }
     else:
         mapping = best_mapping(c, cal)
         layout_diagnostics = {
@@ -1107,16 +1178,38 @@ def run_pipeline(
         }
 
     decoder_c, decoder_noise_model = calibrated_decoder_circuit(c, mapping, distance, rounds, basis, cal, mode=decoder_noise)
+    synthetic_defect_qubits = [int(q) for q in (synthetic_defect_qubits or [])]
+    synthetic_defect_couplers = [tuple(sorted((int(a), int(b)))) for a, b in (synthetic_defect_couplers or [])]
+    if synthetic_defect_qubits or synthetic_defect_couplers:
+        if run_mode != "synthetic":
+            raise ValueError("synthetic defects are only supported with run_mode='synthetic'")
+        decoder_c = add_synthetic_defect_noise(
+            decoder_c,
+            defect_qubits=synthetic_defect_qubits,
+            defect_couplers=synthetic_defect_couplers,
+            probability=synthetic_defect_probability,
+        )
+        decoder_noise_model = {
+            "base": decoder_noise_model,
+            "synthetic_defect_qubits": synthetic_defect_qubits,
+            "synthetic_defect_couplers": synthetic_defect_couplers,
+            "synthetic_defect_probability": synthetic_defect_probability,
+        }
 
     if run_mode == "hardware":
         backend_mapping = iqm_label_mapping_to_backend_indices(mapping, backend)
         unavailable_backend_qubits = unavailable_backend_qubits_from_calibration(cal, backend)
+        unavailable_backend_couplers = {
+            tuple(sorted((backend.qubit_name_to_index(f"QB{a}"), backend.qubit_name_to_index(f"QB{b}"))))
+            for a, b in unavailable_iqm_couplers
+        }
         if allow_skipped_hardware_gates:
             qc, meas_order, skipped_hardware_ops = stim_to_qiskit_mapped_tolerant(
                 c,
                 backend_mapping,
                 backend=backend,
                 unavailable_backend_qubits=unavailable_backend_qubits,
+                unavailable_backend_couplers=unavailable_backend_couplers,
             )
             if skipped_hardware_ops:
                 warnings.warn("Full backend validation was skipped because impossible operations were intentionally omitted.")
@@ -1152,6 +1245,11 @@ def run_pipeline(
         "decoder_noise": decoder_noise,
         "noise_model": decoder_noise_model,
         "layout_diagnostics": layout_diagnostics,
+        "synthetic_defect_qubits": synthetic_defect_qubits,
+        "synthetic_defect_couplers": synthetic_defect_couplers,
+        "synthetic_defect_probability": synthetic_defect_probability if synthetic_defect_qubits or synthetic_defect_couplers else None,
+        "unavailable_iqm_couplers": sorted(unavailable_iqm_couplers),
+        "swap_count": transpile_diagnostics.get("swap_count") if transpile_diagnostics else None,
         "skipped_hardware_operation_count": len(skipped_hardware_ops),
         "shots_decoded": len(memory),
         "corrected_ler": decoded["corrected_ler"],
@@ -1207,7 +1305,7 @@ def fit_round_sweep(results: list[dict]) -> dict:
 
 
 def plot_logical_error_rate(fit: dict, save_path: str | None = None):
-    """Plot logical error probability vs rounds with linear and log-y panels."""
+    """Plot logical error probability vs rounds on a readable linear scale."""
     import matplotlib.pyplot as plt
 
     rounds = fit["rounds"]
@@ -1245,31 +1343,18 @@ def plot_logical_error_rate(fit: dict, save_path: str | None = None):
         ax.set_ylim(max(0.0, lo - margin), min(1.0, hi + margin))
 
     plotted_values = [*y_c, *y_u, *fit_y_c, *fit_y_u]
-    if fit["corrected_was_folded"] or fit["uncorrected_was_folded"]:
-        plotted_values += [*fit["corrected_prob"], *fit["uncorrected_prob"]]
-
-    fig, axes = plt.subplots(1, 2, figsize=(13, 4.6))
-    for ax, log_scale in [(axes[0], False), (axes[1], True)]:
-        ax.plot(rounds, y_u, "o", color="#94a3b8", label="uncorrected probability")
-        ax.plot(xs, fit_y_u, "--", color="#64748b", label=f"uncorrected fit, eps_L={eps_u:.4g}")
-        ax.plot(rounds, y_c, "o", color="#2563eb", label="MWPM corrected probability")
-        ax.plot(xs, fit_y_c, "-", color="#2563eb", label=f"corrected fit, eps_L={eps_c:.4g}")
-        if fit["corrected_was_folded"] or fit["uncorrected_was_folded"]:
-            ax.plot(rounds, fit["uncorrected_prob"], "x", color="#64748b", alpha=0.6, label="raw uncorrected")
-            ax.plot(rounds, fit["corrected_prob"], "x", color="#2563eb", alpha=0.6, label="raw corrected")
-        ax.axhline(0.5, color="black", lw=1, alpha=0.25)
-        ax.set_xlabel("surface-code rounds")
-        ax.set_ylabel("logical error probability")
-        ax.grid(True, alpha=0.3)
-        if log_scale:
-            ax.set_yscale("log")
-            set_relevant_ylim(ax, plotted_values, log_scale=True)
-            ax.set_title("log scale")
-        else:
-            set_relevant_ylim(ax, plotted_values, log_scale=False)
-            ax.set_title("linear scale")
-    axes[1].legend(loc="best", fontsize=8)
-    fig.suptitle("Logical error rate extraction", fontsize=13)
+    fig, ax = plt.subplots(figsize=(7.2, 4.8))
+    ax.plot(rounds, y_u, "o", color="#94a3b8", label="uncorrected probability")
+    ax.plot(xs, fit_y_u, "--", color="#64748b", label=f"uncorrected fit, eps_L={eps_u:.4g}")
+    ax.plot(rounds, y_c, "o", color="#2563eb", label="MWPM corrected probability")
+    ax.plot(xs, fit_y_c, "-", color="#2563eb", label=f"corrected fit, eps_L={eps_c:.4g}")
+    ax.axhline(0.5, color="black", lw=1, alpha=0.25)
+    ax.set_xlabel("surface-code rounds")
+    ax.set_ylabel("logical error probability")
+    ax.grid(True, alpha=0.3)
+    set_relevant_ylim(ax, plotted_values, log_scale=False)
+    ax.legend(loc="best", fontsize=8)
+    ax.set_title(f"Logical error rate extraction\nMWPM eps_L={eps_c:.4g}, uncorrected eps_L={eps_u:.4g}", fontsize=12)
     fig.tight_layout()
     if save_path:
         fig.savefig(save_path, dpi=220, bbox_inches="tight")
@@ -1292,11 +1377,18 @@ def run_round_sweep(
     save_stim_file: bool = True,
     optimize_layout: bool | None = None,
     allow_skipped_hardware_gates: bool = True,
+    synthetic_defect_qubits=None,
+    synthetic_defect_couplers=None,
+    synthetic_defect_probability: float = 0.5,
+    fixed_mapping: dict[int, int] | None = None,
+    unavailable_iqm_couplers=None,
     show_error_plot: bool = True,
 ) -> dict:
     """Run the normal IQM QEC pipeline over several rounds and fit logical error rate."""
     if refresh_calibration:
         cal = refresh_calibration_if_needed(cal, api_url, token, quantum_computer)
+    synthetic_defect_qubits = [int(q) for q in (synthetic_defect_qubits or [])]
+    synthetic_defect_couplers = [tuple(sorted((int(a), int(b)))) for a, b in (synthetic_defect_couplers or [])]
 
     results = []
     for rounds in round_values:
@@ -1316,6 +1408,11 @@ def run_round_sweep(
             save_stim_file=save_stim_file,
             optimize_layout=optimize_layout,
             allow_skipped_hardware_gates=allow_skipped_hardware_gates,
+            synthetic_defect_qubits=synthetic_defect_qubits,
+            synthetic_defect_couplers=synthetic_defect_couplers,
+            synthetic_defect_probability=synthetic_defect_probability,
+            fixed_mapping=fixed_mapping,
+            unavailable_iqm_couplers=unavailable_iqm_couplers,
         )
         out["summary"]["rounds"] = int(rounds)
         results.append(out)
@@ -1323,7 +1420,7 @@ def run_round_sweep(
         print(
             f"rounds={rounds} | corrected_prob={s['corrected_ler']:.5g} | "
             f"uncorrected_prob={s['uncorrected_ler']:.5g} | "
-            f"skipped_ops={s['skipped_hardware_operation_count']} | job={s['job_id']}"
+            f"swap_count={s['swap_count']} | skipped_ops={s['skipped_hardware_operation_count']} | job={s['job_id']}"
         )
 
     fit = fit_round_sweep(results)
@@ -1342,6 +1439,11 @@ def run_round_sweep(
             "uncorrected_logical_error_rate": fit["uncorrected_fit"]["epsilon_l"],
             "mapping": results[0]["summary"]["mapping"],
             "layout_diagnostics": results[0]["summary"]["layout_diagnostics"],
+            "synthetic_defect_qubits": synthetic_defect_qubits,
+            "synthetic_defect_couplers": synthetic_defect_couplers,
+            "synthetic_defect_probability": synthetic_defect_probability if synthetic_defect_qubits or synthetic_defect_couplers else None,
+            "unavailable_iqm_couplers": results[0]["summary"]["unavailable_iqm_couplers"],
+            "swap_count": results[0]["summary"]["swap_count"],
             "skipped_hardware_operation_count": results[0]["summary"]["skipped_hardware_operation_count"],
         },
     }
